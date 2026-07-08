@@ -1,0 +1,278 @@
+From 82ed29192514117f3a393eab5a4f1a2ce8e3ae1d Mon Sep 17 00:00:00 2001
+From: alien1403 <hanghicelrazvanmihai@gmail.com>
+Date: Wed, 8 Jul 2026 10:48:37 +0300
+Subject: [PATCH] feat: Add hardware-accelerated Q4_0 support for ET-SoC1
+ tensor engine
+
+---
+ ggml/src/ggml-et/CMakeLists.txt               |   1 +
+ ggml/src/ggml-et/et-kernels/src/block_ops.h   |  71 ++++++++++
+ .../src/ggml-et/et-kernels/src/mul_mat_Q4_0.c | 129 ++++++++++++++++++
+ ggml/src/ggml-et/ggml-et-ops.cpp              |   7 +
+ ggml/src/ggml-et/ggml-et.cpp                  |   2 +-
+ 5 files changed, 209 insertions(+), 1 deletion(-)
+ create mode 100644 ggml/src/ggml-et/et-kernels/src/mul_mat_Q4_0.c
+
+diff --git a/ggml/src/ggml-et/CMakeLists.txt b/ggml/src/ggml-et/CMakeLists.txt
+index 496269e2b..53c05c720 100644
+--- a/ggml/src/ggml-et/CMakeLists.txt
++++ b/ggml/src/ggml-et/CMakeLists.txt
+@@ -34,6 +34,7 @@ set(KERNELS
+     mul_mat_f32_matrix_engine
+     mul_mat_id_f32
+     mul_mat_Q8_0
++    mul_mat_Q4_0
+     mul_mat_f16
+     rope_f32
+     rms_norm_f32
+diff --git a/ggml/src/ggml-et/et-kernels/src/block_ops.h b/ggml/src/ggml-et/et-kernels/src/block_ops.h
+index 967740219..f83e094a2 100644
+--- a/ggml/src/ggml-et/et-kernels/src/block_ops.h
++++ b/ggml/src/ggml-et/et-kernels/src/block_ops.h
+@@ -74,6 +74,77 @@ static inline float compute_block_dot_product_q8_0(const block_q8_0* a_block, co
+     return final_sum * scale;
+ }
+ 
++// Compute dot product between dequantized q4_0 block and f32 column vector
++// Vectorized: processes 8 elements at a time using ET vector instructions
++// Block size: 32 int4 values packed in 16 bytes (QK4_0)
++static inline float compute_block_dot_product_q4_0(const block_q4_0* a_block, const float* b_col_start) {
++    const float scale = fp16_to_fp32(a_block->d);
++    const float bias = -8.0f * scale;
++
++    unsigned long temp_mask;
++    __asm__ volatile("mova.x.m %0" : "=r"(temp_mask));
++    __asm__ volatile("mov.m.x m0, x0, 0xFF");
++    __asm__ volatile("fbci.pi f10, 0" ::: "f10"); // accumulator
++
++    static const int32_t gather_pattern[8] = {0, 1, 2, 3, 4, 5, 6, 7};
++    __asm__ volatile("flw.ps f31, %[gather]\n" : : [gather] "m"(*(const int32_t(*)[8])gather_pattern) : "f31");
++
++    __asm__ volatile (
++        "fbcx.ps f20, %[scale] \n\t"
++        "fbcx.ps f21, %[bias] \n\t"
++        : : [scale] "r"(scale), [bias] "r"(bias) : "f20", "f21"
++    );
++
++    for (int chunk = 0; chunk < 2; chunk++) {
++        int byte_offset = chunk << 3;      // 0, 8
++        int elem_offset = chunk << 3;      // 0, 8
++        int high_elem_offset = elem_offset + 16; // 16, 24
++        
++        __asm__ volatile(
++            "fgb.ps f11, f31(%[a_ptr])\n"      
++            
++            // low nibbles
++            "fandi.pi f12, f11, 0xF\n"         
++            "fcvt.ps.pw f12, f12\n"            
++            "fmul.ps f12, f12, f20\n"
++            "fadd.ps f12, f12, f21\n"
++            "flw.ps f13, %[b_low]\n"           
++            "fmadd.ps f10, f12, f13, f10\n"    
++            
++            // high nibbles
++            "fsrli.pi f14, f11, 4\n"           
++            "fandi.pi f14, f14, 0xF\n"         
++            "fcvt.ps.pw f14, f14\n"            
++            "fmul.ps f14, f14, f20\n"
++            "fadd.ps f14, f14, f21\n"
++            "flw.ps f15, %[b_high]\n"          
++            "fmadd.ps f10, f14, f15, f10\n"    
++            
++            :
++            : [a_ptr] "r"(&a_block->qs[byte_offset]),
++              [b_low] "m"(*(const float(*)[8])&b_col_start[elem_offset]),
++              [b_high] "m"(*(const float(*)[8])&b_col_start[high_elem_offset])
++            : "f11", "f12", "f13", "f14", "f15"
++        );
++    }
++
++    // Horizontal sum
++    float final_sum;
++    __asm__ __volatile__ (
++        "fswizz.ps f1, f10, 0xB1 \n\t"
++        "fadd.ps   f2, f10, f1, rne \n\t"
++        "fswizz.ps f3, f2, 0x4E \n\t"
++        "fadd.ps   f4, f2, f3, rne \n\t"
++        "fmvz.x.ps t0, f4, 4 \n\t"
++        "fbcx.ps   f5, t0 \n\t"
++        "fadd.ps   %[vout], f4, f5, rne \n\t"
++        : [vout] "=f" (final_sum)
++        :: "t0", "f1", "f2", "f3", "f4", "f5"
++    );
++
++    __asm__ volatile("mova.m.x %0" :: "r"(temp_mask));
++    return final_sum;
++}
+ 
+ // Compute dot product between f16 block and f32 column vector (NAIVE VERSION)
+ // Scalar implementation for debugging - no vectorization
+diff --git a/ggml/src/ggml-et/et-kernels/src/mul_mat_Q4_0.c b/ggml/src/ggml-et/et-kernels/src/mul_mat_Q4_0.c
+new file mode 100644
+index 000000000..251269639
+--- /dev/null
++++ b/ggml/src/ggml-et/et-kernels/src/mul_mat_Q4_0.c
+@@ -0,0 +1,129 @@
++//******************************************************************************
++// MUL_MAT Kernel
++// Matrix multiplication: C[M,N] = A[M,K] * B[K,N]
++//******************************************************************************
++
++#include <stdint.h>
++#include "ggml_tensor.h"
++#include "platform.h"
++#include "math_fp.h"
++#include "quants.h"
++#include "block_ops.h"
++
++// Using the block prefetch logic
++static inline void prefetch_weight_row(const void* start_ptr, int64_t num_blocks, uint32_t worker_id) {
++    const uint64_t cache_line_size = 64;
++    uintptr_t self_ptr = (uintptr_t)start_ptr;
++    uintptr_t self_ptr_end = self_ptr + (num_blocks * sizeof(block_q4_0));
++
++    // 1. Align to cache lines and calculate range
++    uint64_t startCL = (self_ptr + 63) >> 6;
++    uint64_t endCL = (self_ptr_end + 63) >> 6;
++    if (endCL >= startCL) {
++        uint64_t total_lines = endCL - startCL + 1;
++        // 2. Load balance across the minions in the Shire (assuming 8 per group for this logic)
++        // Adjust worker_id if using global_id
++        uint32_t local_worker_id = worker_id % 8;
++        uint64_t lines_per_minion = total_lines >> 3;
++        uint64_t extra = total_lines & 7;
++
++        uint64_t offset = local_worker_id * lines_per_minion;
++        if (local_worker_id < extra) {
++            offset += local_worker_id;
++            lines_per_minion++;
++        } else {
++            offset += extra;
++        }
++        self_ptr = (startCL + offset) << 6;
++        int pending_lines = lines_per_minion;
++
++        // 3. Hardware Prefetch Loop (16 lines at a time)
++        for (; pending_lines > 0; pending_lines -= 16) {
++            uint64_t current_batch = (pending_lines > 16 ? 16 : pending_lines) - 1;
++            uint64_t self_size = current_batch; // bits 3:0
++
++            __asm__ __volatile__ (
++                "li    x1, 0x400000000000000 \n"  // Dest = L2 (bits 59:58 = 01)
++                "addi  x31, zero, 64\n"  // Stride = 64 bytes
++                "or    x3, x1, %[ptr]\n"  // Combine Dest + VA
++                "or    x3, x3, %[sz]\n"  // Combine with NumLines
++                "csrw  0x81f, x3\n"  // prefetch_va
++                :
++                : [ptr] "r" (self_ptr),
++                  [sz] "r" (self_size)
++                : "x1", "x3", "x31", "memory"
++            );
++            self_ptr += (16 * 64);
++        }
++    }
++}
++
++int entry_point(struct ggml_et_binary_params* params, void* env) {
++    uint64_t hart_id = get_hart_id();
++    const int64_t stride_m = 2048;
++
++    // Matrix dimensions
++    const int64_t K    = params->src0.ne[0];
++    const int64_t M    = params->src0.ne[1];
++    const int64_t N    = params->src1.ne[1];
++    const int64_t ne02 = params->src0.ne[2];
++    const int64_t ne03 = params->src0.ne[3];
++    const int64_t ne12 = params->src1.ne[2];
++    const int64_t ne13 = params->src1.ne[3];
++
++    // Strides (in bytes)
++    const size_t nb01 = params->src0.nb[1];
++    const size_t nb02 = params->src0.nb[2];
++    const size_t nb03 = params->src0.nb[3];
++
++    const size_t nb11 = params->src1.nb[1];
++    const size_t nb12 = params->src1.nb[2];
++    const size_t nb13 = params->src1.nb[3];
++
++    const size_t nbd1 = params->dst.nb[1];
++    const size_t nbd2 = params->dst.nb[2];
++    const size_t nbd3 = params->dst.nb[3];
++
++    // Q4_0 block size is 32
++    const int64_t K_blocks = K / 32;
++
++    // Broadcasting ratios
++    const int64_t r2 = ne12 / ne02;
++    const int64_t r3 = ne13 / ne03;
++
++    for (int64_t i3 = 0; i3 < ne13; i3++) {
++        const int64_t i03 = i3 / r3;
++        const char* src0_ptr3 = (const char*)params->src0.data + i03 * nb03;
++        const char* src1_ptr3 = (const char*)params->src1.data + i3 * nb13;
++        char* dst_ptr3       = (char*)params->dst.data + i3 * nbd3;
++
++        for (int64_t i2 = 0; i2 < ne12; i2++) {
++            const int64_t i02 = i2 / r2;
++            const char* src0_ptr2 = src0_ptr3 + i02 * nb02;
++            const char* src1_ptr2 = src1_ptr3 + i2 * nb12;
++            char* dst_ptr2       = dst_ptr3 + i2 * nbd2;
++
++            for (int64_t n = 0; n < N; n++) {
++                // src1 is F32, so column pointer moves by nb11
++                const float* b_col_base = (const float*)(src1_ptr2 + n * nb11);
++
++                for (int64_t m = hart_id; m < M; m += stride_m) {
++                    // src0 is Q4_0 blocks, row pointer moves by nb01
++                    const block_q4_0* q_row = (const block_q4_0*)(src0_ptr2 + m * nb01);
++                    float sum = 0.0f;
++
++                    for (int64_t kb = 0; kb < K_blocks; kb++) {
++                        // q_row is a pointer to blocks, so + kb moves by sizeof(block_q4_0)
++                        // b_col is float*, so we move 32 elements (kb << 5)
++                        sum += compute_block_dot_product_q4_0(q_row + kb, b_col_base + (kb << 5));
++                    }
++
++                    // Store result in dst[m, n, i2, i3]
++                    float* dst_entry = (float*)(dst_ptr2 + n * nbd1 + m * sizeof(float));
++                    atomic_store_f32((volatile float*)dst_entry, sum);
++                }
++            }
++        }
++    }
++    return 0;
++}
+diff --git a/ggml/src/ggml-et/ggml-et-ops.cpp b/ggml/src/ggml-et/ggml-et-ops.cpp
+index e9f7a3a26..84164d8c6 100644
+--- a/ggml/src/ggml-et/ggml-et-ops.cpp
++++ b/ggml/src/ggml-et/ggml-et-ops.cpp
+@@ -322,6 +322,13 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context* dev_ctx, const ggml_tens
+         kernel_name = "mul_mat_Q8_0";
+         src0_type_name = "Q8_0";
+ 
++    } else if (node->type == GGML_TYPE_F32 &&
++               node->src[0]->type == GGML_TYPE_Q4_0 &&
++               node->src[1]->type == GGML_TYPE_F32) {
++
++        kernel_name = "mul_mat_Q4_0";
++        src0_type_name = "Q4_0";
++
+     } else if (node->type == GGML_TYPE_F32 &&
+                node->src[0]->type == GGML_TYPE_F16 &&
+                node->src[1]->type == GGML_TYPE_F32) {
+diff --git a/ggml/src/ggml-et/ggml-et.cpp b/ggml/src/ggml-et/ggml-et.cpp
+index 17449fc4e..f26795e2f 100644
+--- a/ggml/src/ggml-et/ggml-et.cpp
++++ b/ggml/src/ggml-et/ggml-et.cpp
+@@ -710,7 +710,7 @@ static bool ggml_backend_et_device_supports_op(ggml_backend_dev_t dev, const ggm
+                 supported = true;
+             }
+             else if (op->type == GGML_TYPE_F32 &&
+-                op->src[0] && (op->src[0]->type == GGML_TYPE_Q8_0 || op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
++                op->src[0] && (op->src[0]->type == GGML_TYPE_Q8_0 || op->src[0]->type == GGML_TYPE_Q4_0 || op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
+                 op->src[1] && op->src[1]->type == GGML_TYPE_F32) {
+ 
+                 // Check first dimension contiguity requirements
+-- 
+2.43.0
+
